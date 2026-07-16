@@ -1,0 +1,25 @@
+[package]
+name = "markguin"
+version = "0.1.0"
+edition = "2024"
+description = "A focused, native Markdown editor written in Rust"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.31", features = ["persistence"] }
+egui_extras = { version = "0.31", features = ["svg"] }
+mathjax-svg-rs = "0.4"
+mermaid-rs-renderer = { version = "0.3", default-features = false }
+resvg = "0.37"
+usvg = { version = "0.37", features = ["text", "system-fonts"] }
+pulldown-cmark = "0.13"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+unicode-width = "0.2"
+
+[dev-dependencies]
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+strip = true

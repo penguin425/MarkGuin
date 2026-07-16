@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MarkGuin third-party licenses</title>
+  <style>
+    body { margin: 0 auto; padding: 2rem; max-width: 64rem; font: 15px/1.5 system-ui, sans-serif; }
+    pre { padding: 1rem; overflow: auto; white-space: pre-wrap; background: #f3f4f6; border-radius: .5rem; }
+    @media (prefers-color-scheme: dark) { body { color: #e5e7eb; background: #111827; } pre { background: #1f2937; } a { color: #7dd3fc; } }
+  </style>
+</head>
+<body>
+  <h1>MarkGuin third-party licenses</h1>
+  <p>This document lists Rust packages incorporated into MarkGuin. Package links provide the corresponding source code.</p>
+  <h2>License overview</h2>
+  <ul>
+  {{#each overview}}
+    <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+  {{/each}}
+  </ul>
+  {{#each licenses}}
+    {{#if first_of_kind}}<h2 id="{{id}}">{{name}}</h2>{{/if}}
+    <h3>{{name}} — used by</h3>
+    <ul>
+    {{#each used_by}}
+      <li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}/{{crate.version}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+    {{/each}}
+    </ul>
+    <pre>{{text}}</pre>
+  {{/each}}
+</body>
+</html>

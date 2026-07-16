@@ -1,0 +1,150 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  licenses:
+    name: Generate legal notices
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install cargo-about
+        run: cargo install --locked --version 0.9.1 --features cli cargo-about
+      - name: Generate dependency license report
+        run: |
+          cargo fetch --locked
+          cargo about generate about.hbs > THIRD_PARTY_LICENSES.html
+          while IFS=$'\t' read -r name version; do
+            grep -F "[$name $version]" THIRD_PARTY_SOURCES.md
+          done < <(cargo metadata --locked --format-version 1 | jq -r '.packages[] | select(.license | contains("MPL-2.0")) | [.name, .version] | @tsv')
+          manifest_path="$(cargo metadata --locked --format-version 1 | jq -r '.packages[] | select(.name == "mathjax-svg-rs") | .manifest_path')"
+          cp "$(dirname "$manifest_path")/js/dist/NOTICE.txt" MATHJAX_NOTICES.txt
+          test -s THIRD_PARTY_LICENSES.html
+          test -s MATHJAX_NOTICES.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: legal-notices
+          path: |
+            LICENSE
+            THIRD_PARTY_LICENSES.html
+            THIRD_PARTY_SOURCES.md
+            MATHJAX_NOTICES.txt
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: licenses
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: markguin-linux-x86_64
+          - name: Windows x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            artifact: markguin-windows-x86_64
+          - name: macOS Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+            artifact: markguin-macos-aarch64
+          - name: macOS Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: markguin-macos-x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Select stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: Test
+        run: cargo test --locked --release --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: legal-notices
+          path: legal
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          package="${{ matrix.artifact }}"
+          mkdir -p "dist/$package"
+          cp "target/${{ matrix.target }}/release/markguin" "dist/$package/markguin"
+          cp legal/* "dist/$package/"
+          tar -C dist -czf "dist/$package.tar.gz" "$package"
+          rm -rf "dist/$package"
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $package = "${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force "dist/$package" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/markguin.exe" "dist/$package/markguin.exe"
+          Copy-Item "legal/*" "dist/$package/"
+          Compress-Archive -Path "dist/$package" -DestinationPath "dist/$package.zip"
+          Remove-Item -Recurse -Force "dist/$package"
+      - name: Package macOS application
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          package="${{ matrix.artifact }}"
+          app="dist/$package/MarkGuin.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/Legal"
+          cp "target/${{ matrix.target }}/release/markguin" "$app/Contents/MacOS/MarkGuin"
+          cp packaging/macos/Info.plist "$app/Contents/Info.plist"
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${GITHUB_RUN_NUMBER}" "$app/Contents/Info.plist"
+          cp legal/* "$app/Contents/Resources/Legal/"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "dist/$package.zip"
+          rm -rf "dist/$package"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: markguin-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum markguin-* > SHA256SUMS.txt
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test "$GITHUB_REF_NAME" = "v$version"
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
