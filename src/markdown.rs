@@ -817,10 +817,10 @@ impl InlineStyle {
             format.extra_letter_spacing = 0.35;
         }
         if self.strike > 0 {
-            format.strikethrough = Stroke::new(1.0, format.color);
+            format.strikethrough = Stroke::new(1.0_f32, format.color);
         }
         if self.link > 0 {
-            format.underline = Stroke::new(1.0, format.color);
+            format.underline = Stroke::new(1.0_f32, format.color);
         }
         if code {
             format.background = Color32::from_rgb(38, 43, 53);
@@ -997,7 +997,10 @@ fn resolved_link_target(target: &str, base_dir: Option<&Path>) -> String {
     if target.starts_with('#') || is_external_target(target) {
         return target.to_owned();
     }
-    format!("file://{}", resolved_local_path(target, base_dir).display())
+    let path = resolved_local_path(target, base_dir)
+        .to_string_lossy()
+        .replace('\\', "/");
+    format!("file://{path}")
 }
 
 fn render_image(ui: &mut Ui, target: &str, alt: &str, base_dir: Option<&Path>) {
