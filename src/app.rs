@@ -15,6 +15,16 @@ use crate::{
 };
 
 const SESSION_KEY: &str = "markguin.session.v1";
+const BG: Color32 = Color32::from_rgb(11, 13, 19);
+const SURFACE: Color32 = Color32::from_rgb(18, 21, 30);
+const SURFACE_RAISED: Color32 = Color32::from_rgb(25, 29, 41);
+const SURFACE_HOVER: Color32 = Color32::from_rgb(34, 39, 55);
+const BORDER: Color32 = Color32::from_rgb(43, 49, 66);
+const TEXT: Color32 = Color32::from_rgb(232, 234, 242);
+const MUTED: Color32 = Color32::from_rgb(143, 150, 171);
+const ACCENT: Color32 = Color32::from_rgb(139, 112, 255);
+const ACCENT_SOFT: Color32 = Color32::from_rgb(52, 43, 91);
+const SUCCESS: Color32 = Color32::from_rgb(92, 205, 157);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ViewMode {
@@ -531,7 +541,7 @@ impl eframe::App for MarkGuin {
         self.status_bar(ctx);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(Color32::from_rgb(18, 21, 27)))
+            .frame(egui::Frame::new().fill(BG))
             .show(ctx, |ui| match self.view {
                 ViewMode::Editor => self.editor(ui),
                 ViewMode::Preview => self.preview(ui),
@@ -560,160 +570,221 @@ impl MarkGuin {
         egui::TopBottomPanel::top("top")
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(25, 29, 37))
-                    .inner_margin(8),
+                    .fill(SURFACE)
+                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .inner_margin(egui::Margin::symmetric(14, 10)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("◒ MarkGuin")
-                            .strong()
-                            .size(18.0)
-                            .color(Color32::from_rgb(112, 189, 255)),
-                    );
-                    ui.separator();
-                    if ui.button("New").clicked() {
+                    egui::Frame::new()
+                        .fill(ACCENT)
+                        .corner_radius(9)
+                        .inner_margin(egui::Margin::symmetric(10, 5))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("M").strong().size(17.0).color(Color32::WHITE));
+                        });
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("MarkGuin").strong().size(17.0).color(TEXT));
+                        ui.label(RichText::new(self.document.title()).size(11.0).color(MUTED));
+                    });
+                    ui.add_space(16.0);
+                    if toolbar_button(ui, "New", "New document").clicked() {
                         self.request_action(PendingAction::New);
                     }
-                    if ui.button("Open").clicked() {
+                    if toolbar_button(ui, "Open", "Open Markdown file").clicked() {
                         self.request_action(PendingAction::Open);
                     }
-                    if ui.button("Save").clicked() {
+                    if accent_button(ui, "Save", "Save document").clicked() {
                         let _ = self.save();
                     }
-                    if ui
-                        .button("Export")
-                        .on_hover_text("Export as standalone HTML")
-                        .clicked()
-                    {
+                    if toolbar_button(ui, "Export", "Export standalone HTML").clicked() {
                         self.export_html();
                     }
-                    ui.separator();
-                    for (label, insert) in [
-                        ("H", Insert::Heading),
-                        ("B", Insert::Bold),
-                        ("I", Insert::Italic),
-                        ("</>", Insert::Code),
-                        ("Link", Insert::Link),
-                        ("❝", Insert::Quote),
-                        ("List", Insert::List),
-                        ("Task", Insert::Task),
-                        ("Table", Insert::Table),
-                        ("—", Insert::Rule),
-                    ] {
-                        if ui.small_button(label).clicked() {
-                            if insert == Insert::Table {
-                                self.show_table_dialog = true;
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if toolbar_button(ui, "Focus", "Distraction-free writing").clicked() {
+                            self.focus_mode = true;
+                        }
+                        if toolbar_button(
+                            ui,
+                            if self.show_outline {
+                                "Outline on"
                             } else {
-                                self.insert(insert);
-                            }
+                                "Outline"
+                            },
+                            "Toggle document outline",
+                        )
+                        .clicked()
+                        {
+                            self.show_outline = !self.show_outline;
                         }
-                    }
-                    if ui
-                        .small_button("TOC")
-                        .on_hover_text("Insert or update table of contents")
-                        .clicked()
-                    {
-                        self.update_table_of_contents();
-                    }
-                    ui.add_space(8.0);
-                    ui.selectable_value(&mut self.view, ViewMode::Editor, "Write");
-                    ui.selectable_value(&mut self.view, ViewMode::Split, "Split");
-                    ui.selectable_value(&mut self.view, ViewMode::Preview, "Read");
-                    if ui
-                        .button(if self.show_outline {
-                            "Hide outline"
-                        } else {
-                            "Outline"
-                        })
-                        .clicked()
-                    {
-                        self.show_outline = !self.show_outline;
-                    }
-                    if ui.button("Focus").clicked() {
-                        self.focus_mode = true;
-                    }
+                        egui::Frame::new()
+                            .fill(SURFACE_RAISED)
+                            .corner_radius(9)
+                            .inner_margin(3)
+                            .show(ui, |ui| {
+                                ui.with_layout(
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.x = 2.0;
+                                        ui.selectable_value(
+                                            &mut self.view,
+                                            ViewMode::Editor,
+                                            "Write",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.view,
+                                            ViewMode::Split,
+                                            "Split",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.view,
+                                            ViewMode::Preview,
+                                            "Read",
+                                        );
+                                    },
+                                );
+                            });
+                    });
                 });
+                ui.add_space(8.0);
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(15, 18, 26))
+                    .corner_radius(9)
+                    .inner_margin(egui::Margin::symmetric(9, 5))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("FORMAT").strong().size(9.0).color(MUTED));
+                            for (label, insert) in [
+                                ("Heading", Insert::Heading),
+                                ("Bold", Insert::Bold),
+                                ("Italic", Insert::Italic),
+                                ("Code", Insert::Code),
+                                ("Link", Insert::Link),
+                                ("Quote", Insert::Quote),
+                                ("List", Insert::List),
+                                ("Task", Insert::Task),
+                                ("Table", Insert::Table),
+                                ("Rule", Insert::Rule),
+                            ] {
+                                if format_button(ui, label).clicked() {
+                                    if insert == Insert::Table {
+                                        self.show_table_dialog = true;
+                                    } else {
+                                        self.insert(insert);
+                                    }
+                                }
+                            }
+                            if format_button(ui, "TOC")
+                                .on_hover_text("Insert or update table of contents")
+                                .clicked()
+                            {
+                                self.update_table_of_contents();
+                            }
+                        });
+                    });
                 if self.show_find {
-                    ui.horizontal(|ui| {
-                        ui.label("Find");
-                        let response = ui.add(
-                            TextEdit::singleline(&mut self.find_query)
-                                .desired_width(260.0)
-                                .hint_text("Search in document…"),
-                        );
-                        if self.find_focus_requested {
-                            response.request_focus();
-                            self.find_focus_requested = false;
-                        }
-                        let count = if self.find_query.is_empty() {
-                            0
-                        } else {
-                            self.document.text.matches(&self.find_query).count()
-                        };
-                        ui.label(format!("{count} matches"));
-                        if ui.button("Previous").clicked() {
-                            self.find_next(true);
-                        }
-                        if ui.button("Next").clicked() {
-                            self.find_next(false);
-                        }
-                        if ui.button("Close").clicked() {
-                            self.show_find = false;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Replace");
-                        ui.add(
-                            TextEdit::singleline(&mut self.replace_query)
-                                .desired_width(260.0)
-                                .hint_text("Replacement text…"),
-                        );
-                        if ui.button("Replace").clicked() {
-                            self.replace_current();
-                        }
-                        if ui.button("Replace all").clicked() {
-                            self.replace_all();
-                        }
-                    });
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(SURFACE_RAISED)
+                        .corner_radius(10)
+                        .inner_margin(10)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Find").strong().color(TEXT));
+                                let response = ui.add(
+                                    TextEdit::singleline(&mut self.find_query)
+                                        .desired_width(260.0)
+                                        .hint_text("Search in document…"),
+                                );
+                                if self.find_focus_requested {
+                                    response.request_focus();
+                                    self.find_focus_requested = false;
+                                }
+                                let count = if self.find_query.is_empty() {
+                                    0
+                                } else {
+                                    self.document.text.matches(&self.find_query).count()
+                                };
+                                ui.label(RichText::new(format!("{count} matches")).color(MUTED));
+                                if ui.button("Previous").clicked() {
+                                    self.find_next(true);
+                                }
+                                if ui.button("Next").clicked() {
+                                    self.find_next(false);
+                                }
+                                if ui.button("Close").clicked() {
+                                    self.show_find = false;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Replace");
+                                ui.add(
+                                    TextEdit::singleline(&mut self.replace_query)
+                                        .desired_width(260.0)
+                                        .hint_text("Replacement text…"),
+                                );
+                                if ui.button("Replace").clicked() {
+                                    self.replace_current();
+                                }
+                                if ui.button("Replace all").clicked() {
+                                    self.replace_all();
+                                }
+                            });
+                        });
                 }
             });
     }
 
     fn outline(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("outline")
-            .default_width(210.0)
-            .min_width(150.0)
+            .default_width(228.0)
+            .min_width(180.0)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(22, 25, 32))
-                    .inner_margin(10),
+                    .fill(SURFACE)
+                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .inner_margin(egui::Margin::symmetric(14, 16)),
             )
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("OUTLINE")
-                        .small()
-                        .strong()
-                        .color(Color32::from_rgb(125, 135, 153)),
-                );
-                ui.add_space(8.0);
                 let headings = markdown::headings(&self.document.text);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Document").strong().size(15.0).color(TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        egui::Frame::new()
+                            .fill(ACCENT_SOFT)
+                            .corner_radius(10)
+                            .inner_margin(egui::Margin::symmetric(7, 2))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(headings.len().to_string())
+                                        .size(10.0)
+                                        .color(Color32::from_rgb(200, 190, 255)),
+                                );
+                            });
+                    });
+                });
+                ui.label(RichText::new("OUTLINE").strong().size(9.0).color(MUTED));
+                ui.add_space(12.0);
                 if headings.is_empty() {
-                    ui.label(
-                        RichText::new("Add a heading to build an outline")
-                            .italics()
-                            .color(Color32::GRAY),
-                    );
+                    egui::Frame::new()
+                        .fill(SURFACE_RAISED)
+                        .corner_radius(10)
+                        .inner_margin(12)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("Add a heading to build your outline").color(MUTED),
+                            );
+                        });
                 }
                 for item in headings {
                     ui.horizontal(|ui| {
-                        ui.add_space((item.level.saturating_sub(1) * 10) as f32);
+                        ui.add_space((item.level.saturating_sub(1) * 11) as f32);
                         if ui
                             .selectable_label(
                                 false,
                                 RichText::new(item.title)
-                                    .size((15 - item.level.min(4)) as f32)
-                                    .color(Color32::from_rgb(190, 198, 212)),
+                                    .size((15 - item.level.min(3)) as f32)
+                                    .color(if item.level == 1 { TEXT } else { MUTED }),
                             )
                             .on_hover_text(format!("Go to line {}", item.line))
                             .clicked()
@@ -783,10 +854,18 @@ impl MarkGuin {
             return;
         };
         egui::Window::new("Unsaved changes")
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Unsaved changes")
+                        .strong()
+                        .size(18.0)
+                        .color(TEXT),
+                );
+                ui.add_space(4.0);
                 ui.label(format!("Save changes to {}?", self.document.title()));
                 ui.label(
                     RichText::new("Your changes will be lost if you discard them.")
@@ -815,10 +894,19 @@ impl MarkGuin {
             return;
         }
         egui::Window::new("Insert table")
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Insert table")
+                        .strong()
+                        .size(18.0)
+                        .color(TEXT),
+                );
+                ui.label(RichText::new("Choose the table dimensions").color(MUTED));
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.label("Columns");
                     ui.add(egui::DragValue::new(&mut self.table_columns).range(1..=12));
@@ -853,10 +941,18 @@ impl MarkGuin {
         };
         let missing = state == DiskState::Missing;
         egui::Window::new("File changed outside MarkGuin")
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("File changed outside MarkGuin")
+                        .strong()
+                        .size(18.0)
+                        .color(TEXT),
+                );
+                ui.add_space(4.0);
                 ui.label(if missing {
                     "The file was removed or moved on disk."
                 } else {
@@ -943,8 +1039,9 @@ impl MarkGuin {
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(25, 29, 37))
-                    .inner_margin(6),
+                    .fill(SURFACE)
+                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .inner_margin(egui::Margin::symmetric(12, 7)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -971,22 +1068,32 @@ impl MarkGuin {
                                 .unwrap_or_else(|| "Unsaved document".into()),
                         )
                         .small()
-                        .color(Color32::from_rgb(140, 150, 168)),
+                        .color(MUTED),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(format!(
-                            "{} lines  ·  {} words",
-                            self.document.line_count(),
-                            self.document.word_count()
-                        ));
+                        egui::Frame::new()
+                            .fill(SURFACE_RAISED)
+                            .corner_radius(9)
+                            .inner_margin(egui::Margin::symmetric(8, 2))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} lines  ·  {} words",
+                                        self.document.line_count(),
+                                        self.document.word_count()
+                                    ))
+                                    .size(11.0)
+                                    .color(MUTED),
+                                );
+                            });
                         if let Some(status) = &self.status {
-                            ui.label(RichText::new(status).color(Color32::from_rgb(112, 189, 255)));
+                            ui.label(RichText::new(status).color(Color32::from_rgb(176, 160, 255)));
                         }
-                        ui.label(
-                            RichText::new("Recovery on")
-                                .small()
-                                .color(Color32::from_rgb(112, 170, 132)),
-                        )
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("●").size(9.0).color(SUCCESS));
+                            ui.label(RichText::new("Recovery").size(11.0).color(MUTED));
+                        })
+                        .response
                         .on_hover_text("The current session is saved automatically");
                     });
                 });
@@ -1134,13 +1241,87 @@ fn replace_all_literal(source: &str, query: &str, replacement: &str) -> (String,
     (source.replace(query, replacement), count)
 }
 
+fn toolbar_button(ui: &mut egui::Ui, label: &str, tooltip: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(label).size(12.0).color(TEXT))
+            .fill(SURFACE_RAISED)
+            .stroke(egui::Stroke::new(1.0, BORDER))
+            .corner_radius(8)
+            .min_size(egui::vec2(52.0, 30.0)),
+    )
+    .on_hover_text(tooltip)
+}
+
+fn accent_button(ui: &mut egui::Ui, label: &str, tooltip: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            RichText::new(label)
+                .strong()
+                .size(12.0)
+                .color(Color32::WHITE),
+        )
+        .fill(ACCENT)
+        .stroke(egui::Stroke::NONE)
+        .corner_radius(8)
+        .min_size(egui::vec2(56.0, 30.0)),
+    )
+    .on_hover_text(tooltip)
+}
+
+fn format_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(label).size(11.0).color(MUTED))
+            .fill(Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(7)
+            .min_size(egui::vec2(40.0, 26.0)),
+    )
+}
+
 fn configure_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::dark();
-    style.visuals.panel_fill = Color32::from_rgb(18, 21, 27);
-    style.visuals.extreme_bg_color = Color32::from_rgb(14, 17, 22);
-    style.visuals.selection.bg_fill = Color32::from_rgb(45, 92, 138);
-    style.spacing.item_spacing = egui::vec2(7.0, 6.0);
+    style.visuals.override_text_color = Some(TEXT);
+    style.visuals.panel_fill = BG;
+    style.visuals.window_fill = SURFACE;
+    style.visuals.window_stroke = egui::Stroke::new(1.0, BORDER);
+    style.visuals.window_corner_radius = egui::CornerRadius::same(14);
+    style.visuals.menu_corner_radius = egui::CornerRadius::same(10);
+    style.visuals.extreme_bg_color = Color32::from_rgb(13, 16, 23);
+    style.visuals.faint_bg_color = SURFACE_RAISED;
+    style.visuals.code_bg_color = Color32::from_rgb(28, 31, 43);
+    style.visuals.hyperlink_color = Color32::from_rgb(164, 145, 255);
+    style.visuals.selection.bg_fill = ACCENT_SOFT;
+    style.visuals.selection.stroke = egui::Stroke::new(1.0, Color32::from_rgb(197, 185, 255));
+    style.visuals.widgets.noninteractive.bg_fill = SURFACE;
+    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT);
+    style.visuals.widgets.inactive.weak_bg_fill = SURFACE_RAISED;
+    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, MUTED);
+    style.visuals.widgets.hovered.weak_bg_fill = SURFACE_HOVER;
+    style.visuals.widgets.hovered.bg_fill = SURFACE_HOVER;
+    style.visuals.widgets.hovered.bg_stroke =
+        egui::Stroke::new(1.0, Color32::from_rgb(76, 67, 121));
+    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, TEXT);
+    style.visuals.widgets.active.weak_bg_fill = ACCENT_SOFT;
+    style.visuals.widgets.active.bg_fill = ACCENT_SOFT;
+    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
+    for widget in [
+        &mut style.visuals.widgets.noninteractive,
+        &mut style.visuals.widgets.inactive,
+        &mut style.visuals.widgets.hovered,
+        &mut style.visuals.widgets.active,
+        &mut style.visuals.widgets.open,
+    ] {
+        widget.corner_radius = egui::CornerRadius::same(8);
+    }
+    style.visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
+    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.window_margin = egui::Margin::same(16);
+    style.spacing.indent = 18.0;
     ctx.set_style(style);
 }
 
