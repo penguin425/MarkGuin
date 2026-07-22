@@ -7,6 +7,7 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -159,9 +160,84 @@ fn extract_svg(output: &str) -> Result<String, String> {
         .rfind("</svg>")
         .map(|position| position + "</svg>".len())
         .ok_or_else(|| "Renderer output had an incomplete SVG element".to_owned())?;
-    Ok(output[start..end]
+    Ok(strip_svg_event_handlers(&output[start..end])
         .replace("currentColor", "#dce3ee")
         .replace("<script", "<discarded-script"))
+}
+
+/// Best-effort removal of inline event-handler attributes (`on…=`) from an SVG
+/// fragment before it is embedded in an exported HTML document. The SVG is
+/// rasterized for on-screen preview (so it is never executed there), but the
+/// standalone export embeds it inline, where `onload`/`onclick` handlers could
+/// otherwise run when the file is opened in a browser.
+fn strip_svg_event_handlers(svg: &str) -> String {
+    let bytes = svg.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace()
+            && is_event_handler(bytes, i + 1)
+            && let Some(next) = skip_attribute(bytes, i + 1)
+        {
+            i = next;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| svg.to_owned())
+}
+
+fn is_event_handler(bytes: &[u8], start: usize) -> bool {
+    // `on` followed by an ASCII letter, then a name, then `=`.
+    if start + 2 >= bytes.len() || bytes[start] != b'o' || bytes[start + 1] != b'n' {
+        return false;
+    }
+    let mut j = start + 2;
+    if !bytes[j].is_ascii_alphabetic() {
+        return false;
+    }
+    j += 1;
+    while j < bytes.len() && bytes[j].is_ascii_alphanumeric() {
+        j += 1;
+    }
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    j < bytes.len() && bytes[j] == b'='
+}
+
+fn skip_attribute(bytes: &[u8], start: usize) -> Option<usize> {
+    // `start` points at the `o` of `on…`. Skip the name, `=`, and value.
+    let mut j = start;
+    while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b'=' {
+        j += 1;
+    }
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= bytes.len() || bytes[j] != b'=' {
+        return None;
+    }
+    j += 1;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+        let quote = bytes[j];
+        j += 1;
+        while j < bytes.len() && bytes[j] != quote {
+            j += 1;
+        }
+        if j < bytes.len() {
+            j += 1;
+        }
+    } else {
+        while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b'>' {
+            j += 1;
+        }
+    }
+    Some(j)
 }
 
 fn load_svg_with_fonts(svg: &[u8]) -> Result<egui::ColorImage, String> {
@@ -191,15 +267,63 @@ fn load_svg_with_fonts(svg: &[u8]) -> Result<egui::ColorImage, String> {
     ))
 }
 
+/// How long a render request must stay unchanged before a worker thread is
+/// spawned. While the user is typing, every keystroke produces a new cache
+/// key; debouncing avoids spawning a worker thread per keystroke.
+const RENDER_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Maximum number of entries kept per render cache. Once exceeded, the
+/// least-recently used entry is evicted, which also releases its GPU texture.
+/// This keeps memory usage bounded over long editing sessions.
+const RENDER_CACHE_CAPACITY: usize = 256;
+
 #[derive(Clone)]
-enum DiagramRender {
-    Pending,
-    Ready(String),
+struct Rendered {
+    svg: String,
+    texture: Option<egui::TextureHandle>,
+}
+
+#[derive(Clone)]
+enum RenderState {
+    Pending { since: Instant, started: bool },
+    Ready(Rendered),
     Failed(String),
 }
 
-fn diagram_cache() -> &'static Mutex<HashMap<String, DiagramRender>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, DiagramRender>>> = OnceLock::new();
+/// Capacity-bounded LRU cache shared by the math and diagram renderers.
+#[derive(Default)]
+struct RenderCache {
+    entries: HashMap<String, (RenderState, u64)>,
+    clock: u64,
+}
+
+impl RenderCache {
+    fn get(&mut self, key: &str) -> Option<RenderState> {
+        self.clock += 1;
+        let (state, tick) = self.entries.get_mut(key)?;
+        *tick = self.clock;
+        Some(state.clone())
+    }
+
+    fn insert(&mut self, key: String, state: RenderState) {
+        self.clock += 1;
+        self.entries.insert(key, (state, self.clock));
+        while self.entries.len() > RENDER_CACHE_CAPACITY {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, tick))| tick)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
+fn diagram_cache() -> &'static Mutex<RenderCache> {
+    static CACHE: OnceLock<Mutex<RenderCache>> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
@@ -207,40 +331,98 @@ fn diagram_key(language: DiagramLanguage, source: &str) -> String {
     format!("{}:{source}", language.css_name())
 }
 
+/// Requests a rendered SVG, spawning at most one debounced worker per key.
+///
+/// Returns `None` while the request is debouncing or rendering, and `Some`
+/// once a result (or a cached failure) is available.
+fn request_render(
+    cache: &'static Mutex<RenderCache>,
+    key: String,
+    thread_name: String,
+    ctx: &egui::Context,
+    render: impl FnOnce(&egui::Context) -> Result<Rendered, String> + Send + 'static,
+) -> Option<Result<Rendered, String>> {
+    {
+        let mut cache = cache.lock().expect("render cache poisoned");
+        match cache.get(&key) {
+            Some(RenderState::Ready(rendered)) => return Some(Ok(rendered)),
+            Some(RenderState::Failed(error)) => return Some(Err(error)),
+            Some(RenderState::Pending { since, started }) => {
+                if started || since.elapsed() < RENDER_DEBOUNCE {
+                    return None;
+                }
+                cache.insert(
+                    key.clone(),
+                    RenderState::Pending {
+                        since,
+                        started: true,
+                    },
+                );
+            }
+            None => {
+                cache.insert(
+                    key.clone(),
+                    RenderState::Pending {
+                        since: Instant::now(),
+                        started: false,
+                    },
+                );
+                return None;
+            }
+        }
+    }
+    let worker_ctx = ctx.clone();
+    std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let entry = match render(&worker_ctx) {
+                Ok(rendered) => RenderState::Ready(rendered),
+                Err(error) => RenderState::Failed(error),
+            };
+            cache
+                .lock()
+                .expect("render cache poisoned")
+                .insert(key, entry);
+            worker_ctx.request_repaint();
+        })
+        .expect("failed to spawn render thread");
+    None
+}
+
+fn rasterize_svg(
+    ctx: &egui::Context,
+    name: String,
+    svg: &str,
+) -> Result<egui::TextureHandle, String> {
+    let image = load_svg_with_fonts(svg.as_bytes())?;
+    Ok(ctx.load_texture(name, image, egui::TextureOptions::LINEAR))
+}
+
 fn request_diagram_svg(
     ctx: &egui::Context,
     language: DiagramLanguage,
     source: &str,
-) -> Option<Result<String, String>> {
+) -> Option<Result<Rendered, String>> {
     let key = diagram_key(language, source);
-    {
-        let mut cache = diagram_cache().lock().expect("diagram cache poisoned");
-        match cache.get(&key) {
-            Some(DiagramRender::Ready(svg)) => return Some(Ok(svg.clone())),
-            Some(DiagramRender::Failed(error)) => return Some(Err(error.clone())),
-            Some(DiagramRender::Pending) => return None,
-            None => {
-                cache.insert(key.clone(), DiagramRender::Pending);
-            }
-        }
-    }
     let source = source.to_owned();
-    let ctx = ctx.clone();
-    std::thread::Builder::new()
-        .name(format!("markguin-{}-render", language.css_name()))
-        .spawn(move || {
-            let entry = match render_diagram_svg(language, &source) {
-                Ok(svg) => DiagramRender::Ready(svg),
-                Err(error) => DiagramRender::Failed(error),
-            };
-            diagram_cache()
-                .lock()
-                .expect("diagram cache poisoned")
-                .insert(key, entry);
-            ctx.request_repaint();
-        })
-        .expect("failed to spawn diagram rendering thread");
-    None
+    request_render(
+        diagram_cache(),
+        key,
+        format!("markguin-{}-render", language.css_name()),
+        ctx,
+        move |ctx| {
+            let svg = render_diagram_svg(language, &source)?;
+            let mut hasher = DefaultHasher::new();
+            language.hash(&mut hasher);
+            source.hash(&mut hasher);
+            let texture =
+                rasterize_svg(ctx, format!("markguin-diagram-{}", hasher.finish()), &svg)?;
+            Ok(Rendered {
+                svg,
+                texture: Some(texture),
+            })
+        },
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -297,27 +479,36 @@ fn heading_level(level: HeadingLevel) -> usize {
 /// Creates a source-preserving layout job with lightweight Markdown syntax coloring.
 pub fn highlight_source(source: &str) -> LayoutJob {
     let mut job = LayoutJob::default();
-    let mut fenced = false;
+    let mut fence_open = false;
+    let mut fence_char = '\0';
     for line in source.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        let color = if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-            Color32::from_rgb(116, 190, 255)
-        } else if fenced {
-            Color32::from_rgb(196, 215, 190)
+        let color = if !fence_open && (trimmed.starts_with("```") || trimmed.starts_with("~~~")) {
+            fence_open = true;
+            fence_char = trimmed.chars().next().unwrap();
+            Color32::from_rgb(116, 176, 226)
+        } else if fence_open
+            && ((fence_char == '`' && trimmed.starts_with("```"))
+                || (fence_char == '~' && trimmed.starts_with("~~~")))
+        {
+            fence_open = false;
+            fence_char = '\0';
+            Color32::from_rgb(116, 176, 226)
+        } else if fence_open {
+            Color32::from_rgb(174, 192, 169)
         } else if trimmed.starts_with('#') {
-            Color32::from_rgb(130, 196, 255)
+            Color32::from_rgb(126, 181, 230)
         } else if trimmed.starts_with('>') {
-            Color32::from_rgb(157, 190, 173)
+            Color32::from_rgb(146, 177, 163)
         } else if trimmed.starts_with("- ")
             || trimmed.starts_with("* ")
             || trimmed.starts_with("+ ")
         {
-            Color32::from_rgb(222, 181, 112)
+            Color32::from_rgb(205, 166, 105)
         } else if trimmed.starts_with('|') {
-            Color32::from_rgb(201, 166, 222)
+            Color32::from_rgb(184, 153, 204)
         } else {
-            Color32::from_rgb(205, 210, 220)
+            Color32::from_rgb(178, 182, 193)
         };
         job.append(
             line,
@@ -387,15 +578,8 @@ fn math_html(tex: &str, display: bool) -> Event<'static> {
     Event::Html(html.into())
 }
 
-#[derive(Clone)]
-enum MathRender {
-    Pending,
-    Ready(String),
-    Failed(String),
-}
-
-fn math_cache() -> &'static Mutex<HashMap<String, MathRender>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, MathRender>>> = OnceLock::new();
+fn math_cache() -> &'static Mutex<RenderCache> {
+    static CACHE: OnceLock<Mutex<RenderCache>> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
@@ -470,22 +654,20 @@ fn convert_svg_ex_dimension(
 
 fn render_math_svg(tex: &str, display: bool) -> Result<String, String> {
     let key = math_key(tex, display);
-    if let Some(cached) = math_cache()
-        .lock()
-        .expect("math cache poisoned")
-        .get(&key)
-        .cloned()
-    {
+    if let Some(cached) = math_cache().lock().expect("math cache poisoned").get(&key) {
         match cached {
-            MathRender::Ready(svg) => return Ok(svg),
-            MathRender::Failed(error) => return Err(error),
-            MathRender::Pending => {}
+            RenderState::Ready(rendered) => return Ok(rendered.svg),
+            RenderState::Failed(error) => return Err(error),
+            RenderState::Pending { .. } => {}
         }
     }
     let result = render_math_svg_uncached(tex, display);
     let entry = match &result {
-        Ok(svg) => MathRender::Ready(svg.clone()),
-        Err(error) => MathRender::Failed(error.clone()),
+        Ok(svg) => RenderState::Ready(Rendered {
+            svg: svg.clone(),
+            texture: None,
+        }),
+        Err(error) => RenderState::Failed(error.clone()),
     };
     math_cache()
         .lock()
@@ -498,37 +680,26 @@ fn request_math_svg(
     ctx: &egui::Context,
     tex: &str,
     display: bool,
-) -> Option<Result<String, String>> {
+) -> Option<Result<Rendered, String>> {
     let key = math_key(tex, display);
-    {
-        let mut cache = math_cache().lock().expect("math cache poisoned");
-        match cache.get(&key) {
-            Some(MathRender::Ready(svg)) => return Some(Ok(svg.clone())),
-            Some(MathRender::Failed(error)) => return Some(Err(error.clone())),
-            Some(MathRender::Pending) => return None,
-            None => {
-                cache.insert(key.clone(), MathRender::Pending);
-            }
-        }
-    }
     let tex = tex.to_owned();
-    let ctx = ctx.clone();
-    std::thread::Builder::new()
-        .name("markguin-math-render".into())
-        .spawn(move || {
-            let result = render_math_svg_uncached(&tex, display);
-            let entry = match result {
-                Ok(svg) => MathRender::Ready(svg),
-                Err(error) => MathRender::Failed(error),
-            };
-            math_cache()
-                .lock()
-                .expect("math cache poisoned")
-                .insert(key, entry);
-            ctx.request_repaint();
-        })
-        .expect("failed to spawn math rendering thread");
-    None
+    request_render(
+        math_cache(),
+        key,
+        "markguin-math-render".into(),
+        ctx,
+        move |ctx| {
+            let svg = render_math_svg_uncached(&tex, display)?;
+            let mut hasher = DefaultHasher::new();
+            tex.hash(&mut hasher);
+            display.hash(&mut hasher);
+            let texture = rasterize_svg(ctx, format!("markguin-math-{}", hasher.finish()), &svg)?;
+            Ok(Rendered {
+                svg,
+                texture: Some(texture),
+            })
+        },
+    )
 }
 
 pub fn upsert_table_of_contents(source: &str) -> (String, bool) {
@@ -536,10 +707,7 @@ pub fn upsert_table_of_contents(source: &str) -> (String, bool) {
     const END: &str = "<!-- /TOC -->";
     let block = format!("{START}\n{}{END}", table_of_contents(source));
 
-    if let Some(start) = source.find(START)
-        && let Some(relative_end) = source[start + START.len()..].find(END)
-    {
-        let end = start + START.len() + relative_end + END.len();
+    if let Some((start, end)) = find_toc_block(source) {
         let mut result = source.to_owned();
         result.replace_range(start..end, &block);
         return (result, true);
@@ -559,6 +727,40 @@ pub fn upsert_table_of_contents(source: &str) -> (String, bool) {
     };
     result.insert_str(insertion, &surrounded);
     (result, false)
+}
+
+/// Locates the `<!-- TOC -->…<!-- /TOC -->` block, ignoring markers that
+/// appear inside fenced code blocks so a code sample containing the markers
+/// is not mistaken for a real table of contents.
+fn find_toc_block(source: &str) -> Option<(usize, usize)> {
+    const START: &str = "<!-- TOC -->";
+    const END: &str = "<!-- /TOC -->";
+    let mut fence_open = false;
+    let mut fence_char = '\0';
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if !fence_open && (trimmed.starts_with("```") || trimmed.starts_with("~~~")) {
+            fence_open = true;
+            fence_char = trimmed.chars().next().unwrap();
+        } else if fence_open
+            && ((fence_char == '`' && trimmed.starts_with("```"))
+                || (fence_char == '~' && trimmed.starts_with("~~~")))
+        {
+            fence_open = false;
+            fence_char = '\0';
+        }
+        if !fence_open && let Some(start_rel) = line.find(START) {
+            let start = offset + start_rel;
+            let after_start = &source[start + START.len()..];
+            if let Some(end_rel) = after_start.find(END) {
+                let end = start + START.len() + end_rel + END.len();
+                return Some((start, end));
+            }
+        }
+        offset += line.len();
+    }
+    None
 }
 
 fn table_of_contents(source: &str) -> String {
@@ -1009,14 +1211,17 @@ fn render_image(ui: &mut Ui, target: &str, alt: &str, base_dir: Option<&Path>) {
         egui::Image::from_uri(target)
     } else {
         let path = resolved_local_path(target, base_dir);
-        let Ok(bytes) = std::fs::read(&path) else {
+        if !path.is_file() {
             ui.colored_label(
                 Color32::from_rgb(235, 130, 130),
                 format!("Image not found: {}", path.display()),
             );
             return;
-        };
-        egui::Image::from_bytes(format!("bytes://{}", path.display()), bytes)
+        }
+        // The egui_extras file loader reads the file once on a background
+        // thread and caches the bytes by URI, instead of re-reading the file
+        // from disk on every frame.
+        egui::Image::new(format!("file://{}", path.display()))
     };
     let response = ui.add(image.max_width(max_width).max_height(720.0));
     if !alt.is_empty() {
@@ -1045,51 +1250,79 @@ fn flush_job(ui: &mut Ui, job: &mut LayoutJob, quote_depth: usize) {
 }
 
 fn render_code(ui: &mut Ui, language: String, code: &str) {
+    let width = ui.available_width();
+    let code = code_block_text(code);
+    let mut hasher = DefaultHasher::new();
+    language.hash(&mut hasher);
+    code.hash(&mut hasher);
     egui::Frame::new()
-        .fill(Color32::from_rgb(24, 28, 36))
-        .corner_radius(6)
-        .inner_margin(12)
+        .fill(Color32::from_rgb(20, 22, 27))
+        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(47, 49, 57)))
+        .corner_radius(9)
+        .inner_margin(egui::Margin::symmetric(14, 11))
         .show(ui, |ui| {
+            ui.set_min_width((width - 28.0).max(80.0));
             if !language.is_empty() {
-                ui.label(
-                    RichText::new(language)
-                        .small()
-                        .color(Color32::from_rgb(112, 189, 255)),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(language.trim())
+                            .strong()
+                            .size(10.0)
+                            .color(Color32::from_rgb(139, 140, 151)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("CODE")
+                                .strong()
+                                .size(9.0)
+                                .color(Color32::from_rgb(84, 86, 96)),
+                        );
+                    });
+                });
+                ui.add_space(6.0);
             }
-            ui.label(
-                RichText::new(code.trim_end())
-                    .monospace()
-                    .color(Color32::from_rgb(224, 228, 236)),
-            );
+            egui::ScrollArea::horizontal()
+                .id_salt(("code-preview", hasher.finish()))
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(code)
+                                .monospace()
+                                .size(13.5)
+                                .color(Color32::from_rgb(216, 219, 228)),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Extend)
+                        .selectable(true),
+                    );
+                });
         });
     ui.add_space(7.0);
 }
 
+fn code_block_text(code: &str) -> &str {
+    code.trim_end_matches(['\r', '\n'])
+}
+
 fn render_math(ui: &mut Ui, tex: &str, display: bool) {
     match request_math_svg(ui.ctx(), tex, display) {
-        Some(Ok(svg)) => {
-            let mut hasher = DefaultHasher::new();
-            tex.hash(&mut hasher);
-            display.hash(&mut hasher);
-            let texture_id = egui::Id::new(("markguin-math", hasher.finish()));
+        Some(Ok(rendered)) => {
             let max_width = ui.available_width().max(80.0);
-            let texture = if let Some(texture) = ui
-                .ctx()
-                .data_mut(|data| data.get_temp::<egui::TextureHandle>(texture_id))
-            {
-                Some(texture)
-            } else {
-                load_svg_with_fonts(svg.as_bytes()).ok().map(|image| {
-                    let texture = ui.ctx().load_texture(
-                        format!("markguin-math-{}", hasher.finish()),
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    );
-                    ui.ctx()
-                        .data_mut(|data| data.insert_temp(texture_id, texture.clone()));
-                    texture
-                })
+            let texture = match rendered.texture {
+                Some(texture) => Some(texture),
+                // Entries produced by the HTML export path have no texture
+                // yet: rasterize once here and store it back in the cache.
+                None => rasterize_svg(ui.ctx(), "markguin-math".into(), &rendered.svg)
+                    .ok()
+                    .inspect(|texture| {
+                        math_cache().lock().expect("math cache poisoned").insert(
+                            math_key(tex, display),
+                            RenderState::Ready(Rendered {
+                                svg: rendered.svg,
+                                texture: Some(texture.clone()),
+                            }),
+                        );
+                    }),
             };
             let Some(texture) = texture else {
                 ui.label(
@@ -1118,6 +1351,9 @@ fn render_math(ui: &mut Ui, tex: &str, display: bool) {
             .on_hover_text(format!("Could not render TeX: {error}"));
         }
         None => {
+            // Wake the UI once the debounce window has passed so the worker
+            // gets spawned even if nothing else triggers a repaint.
+            ui.ctx().request_repaint_after(RENDER_DEBOUNCE);
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(
@@ -1132,30 +1368,8 @@ fn render_math(ui: &mut Ui, tex: &str, display: bool) {
 
 fn render_diagram(ui: &mut Ui, language: DiagramLanguage, source: &str) {
     match request_diagram_svg(ui.ctx(), language, source) {
-        Some(Ok(svg)) => {
-            let mut hasher = DefaultHasher::new();
-            language.hash(&mut hasher);
-            source.hash(&mut hasher);
-            let hash = hasher.finish();
-            let texture_id = egui::Id::new(("markguin-diagram", hash));
-            let texture = if let Some(texture) = ui
-                .ctx()
-                .data_mut(|data| data.get_temp::<egui::TextureHandle>(texture_id))
-            {
-                Some(texture)
-            } else {
-                load_svg_with_fonts(svg.as_bytes()).ok().map(|image| {
-                    let texture = ui.ctx().load_texture(
-                        format!("markguin-diagram-{hash}"),
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    );
-                    ui.ctx()
-                        .data_mut(|data| data.insert_temp(texture_id, texture.clone()));
-                    texture
-                })
-            };
-            if let Some(texture) = texture {
+        Some(Ok(rendered)) => {
+            if let Some(texture) = rendered.texture {
                 let max_width = ui.available_width().max(120.0);
                 ui.horizontal_centered(|ui| {
                     ui.add(
@@ -1170,6 +1384,9 @@ fn render_diagram(ui: &mut Ui, language: DiagramLanguage, source: &str) {
         }
         Some(Err(error)) => render_diagram_error(ui, language, source, &error),
         None => {
+            // Wake the UI once the debounce window has passed so the worker
+            // gets spawned even if nothing else triggers a repaint.
+            ui.ctx().request_repaint_after(RENDER_DEBOUNCE);
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(format!("Rendering {} diagram…", language.css_name()));
@@ -1196,6 +1413,62 @@ fn render_diagram_error(ui: &mut Ui, language: DiagramLanguage, source: &str, er
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ready(svg: &str) -> RenderState {
+        RenderState::Ready(Rendered {
+            svg: svg.to_owned(),
+            texture: None,
+        })
+    }
+
+    #[test]
+    fn render_cache_evicts_least_recently_used_beyond_capacity() {
+        let mut cache = RenderCache::default();
+        for index in 0..=RENDER_CACHE_CAPACITY {
+            cache.insert(format!("key-{index}"), ready("svg"));
+        }
+        assert_eq!(cache.entries.len(), RENDER_CACHE_CAPACITY);
+        assert!(cache.get("key-0").is_none(), "oldest entry was evicted");
+        assert!(cache.get("key-1").is_some());
+
+        // Touch key-1 so it becomes the most recently used entry; the next
+        // eviction must remove key-2 instead.
+        assert!(cache.get("key-1").is_some());
+        cache.insert("key-new".to_owned(), ready("svg"));
+        assert_eq!(cache.entries.len(), RENDER_CACHE_CAPACITY);
+        assert!(cache.get("key-1").is_some());
+        assert!(cache.get("key-2").is_none());
+        assert!(cache.get("key-new").is_some());
+    }
+
+    #[test]
+    fn request_render_debounces_then_completes_on_worker() {
+        let ctx = egui::Context::default();
+        let key = format!("test-render-{}", std::process::id());
+        let render = |_: &egui::Context| {
+            Ok(Rendered {
+                svg: "<svg/>".to_owned(),
+                texture: None,
+            })
+        };
+        // The first request only registers a pending entry, and immediate
+        // follow-ups are still inside the debounce window.
+        assert!(request_render(math_cache(), key.clone(), "test".into(), &ctx, render).is_none());
+        assert!(request_render(math_cache(), key.clone(), "test".into(), &ctx, render).is_none());
+        // After the debounce window the worker is spawned.
+        std::thread::sleep(RENDER_DEBOUNCE + Duration::from_millis(50));
+        assert!(request_render(math_cache(), key.clone(), "test".into(), &ctx, render).is_none());
+        for _ in 0..100 {
+            if matches!(
+                math_cache().lock().expect("math cache poisoned").get(&key),
+                Some(RenderState::Ready(_))
+            ) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("worker render did not complete in time");
+    }
 
     #[test]
     fn extracts_atx_headings() {
@@ -1232,6 +1505,13 @@ mod tests {
         let job = highlight_source("# Heading\nplain\n> quote\n");
         assert_eq!(job.sections.len(), 3);
         assert_ne!(job.sections[0].format.color, job.sections[1].format.color);
+    }
+
+    #[test]
+    fn code_preview_removes_only_terminal_line_endings() {
+        assert_eq!(code_block_text("let value = 1;  \n\n"), "let value = 1;  ");
+        assert_eq!(code_block_text("    indented"), "    indented");
+        assert_eq!(code_block_text("line\r\n"), "line");
     }
 
     #[test]

@@ -130,16 +130,21 @@ pub struct MarkGuin {
     scroll_ratio: f32,
     editor_scroll_max: f32,
     preview_scroll_max: f32,
+    /// Bumped by [`MarkGuin::bump_doc_revision`] whenever the document text
+    /// changes or the document is replaced, so per-frame caches stay valid.
+    doc_revision: u64,
+    outline_cache: Option<(u64, Vec<markdown::Heading>)>,
+    find_count_cache: Option<(u64, String, usize)>,
 }
 
 impl MarkGuin {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_style(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
-        let command_line_document = std::env::args()
-            .nth(1)
-            .map(PathBuf::from)
-            .and_then(|path| Document::open(path).ok());
+        let command_line_path = std::env::args().nth(1).map(PathBuf::from);
+        let command_line_document = command_line_path
+            .as_ref()
+            .and_then(|path| Document::open(path.to_path_buf()).ok());
         let restored = command_line_document
             .is_none()
             .then(|| {
@@ -163,13 +168,19 @@ impl MarkGuin {
                     was_dirty.then(|| "Recovered unsaved changes".into()),
                 )
             } else {
+                let status = command_line_path.as_ref().map(|path| {
+                    format!(
+                        "Could not open {}: not a readable Markdown file",
+                        path.display()
+                    )
+                });
                 (
                     Document::default(),
                     ViewMode::Split,
                     true,
                     false,
                     true,
-                    None,
+                    status,
                 )
             };
         Self {
@@ -196,6 +207,65 @@ impl MarkGuin {
             scroll_ratio: 0.0,
             editor_scroll_max: 0.0,
             preview_scroll_max: 0.0,
+            doc_revision: 0,
+            outline_cache: None,
+            find_count_cache: None,
+        }
+    }
+
+    /// Invalidates the per-frame caches derived from the document text
+    /// (outline headings and find match count). Must be called after every
+    /// mutation of `self.document` or `self.document.text`.
+    fn bump_doc_revision(&mut self) {
+        self.doc_revision += 1;
+    }
+
+    fn cached_headings(&mut self) -> Vec<markdown::Heading> {
+        if let Some((revision, headings)) = &self.outline_cache
+            && *revision == self.doc_revision
+        {
+            return headings.clone();
+        }
+        let headings = markdown::headings(&self.document.text);
+        self.outline_cache = Some((self.doc_revision, headings.clone()));
+        headings
+    }
+
+    fn find_match_count(&mut self) -> usize {
+        if self.find_query.is_empty() {
+            return 0;
+        }
+        if let Some((revision, query, count)) = &self.find_count_cache
+            && *revision == self.doc_revision
+            && *query == self.find_query
+        {
+            return *count;
+        }
+        let count = self.document.text.matches(&self.find_query).count();
+        self.find_count_cache = Some((self.doc_revision, self.find_query.clone(), count));
+        count
+    }
+
+    /// Builds the scroll area used by the editor and preview, applying the
+    /// shared scroll offset when sync-scroll is enabled.
+    fn scroll_area(&self, id: &str, max: f32) -> egui::ScrollArea {
+        let mut area = egui::ScrollArea::both().id_salt(id);
+        if self.sync_scroll {
+            area = area.vertical_scroll_offset(self.scroll_ratio * max);
+        }
+        area
+    }
+
+    /// Updates the shared scroll ratio from a scroll output when the pointer
+    /// hovers over that output, keeping the editor and preview in sync.
+    fn sync_scroll_ratio(&mut self, ui: &egui::Ui, inner_rect: egui::Rect, offset: f32, max: f32) {
+        if self.sync_scroll
+            && ui
+                .ctx()
+                .pointer_hover_pos()
+                .is_some_and(|position| inner_rect.contains(position))
+        {
+            self.scroll_ratio = normalized_scroll(offset, max);
         }
     }
 
@@ -220,6 +290,7 @@ impl MarkGuin {
     fn new_document(&mut self) {
         self.document = Document::default();
         self.document.text.clear();
+        self.bump_doc_revision();
         self.selection = (0, 0);
         self.requested_selection = Some((0, 0));
         self.status = Some("New document".into());
@@ -233,6 +304,7 @@ impl MarkGuin {
             match Document::open(path) {
                 Ok(doc) => {
                     self.document = doc;
+                    self.bump_doc_revision();
                     self.ignore_external_change = false;
                     self.status = Some("Opened".into());
                 }
@@ -299,6 +371,7 @@ impl MarkGuin {
     fn update_table_of_contents(&mut self) {
         let (text, updated) = markdown::upsert_table_of_contents(&self.document.text);
         self.document.text = text;
+        self.bump_doc_revision();
         self.document.dirty = true;
         let cursor = self.cursor_char.min(self.document.text.chars().count());
         self.selection = (cursor, cursor);
@@ -318,6 +391,7 @@ impl MarkGuin {
         }
         if text != self.document.text {
             self.document.text = text;
+            self.bump_doc_revision();
             self.document.dirty = true;
             let cursor = self.cursor_char.min(self.document.text.chars().count());
             self.selection = (cursor, cursor);
@@ -330,6 +404,7 @@ impl MarkGuin {
         let (start, end) = self.selection;
         let (text, selection) = apply_insert(&self.document.text, start, end, kind);
         self.document.text = text;
+        self.bump_doc_revision();
         self.selection = selection;
         self.cursor_char = selection.1;
         self.requested_selection = Some(selection);
@@ -342,6 +417,7 @@ impl MarkGuin {
         let start_byte = char_to_byte(&self.document.text, start);
         let end_byte = char_to_byte(&self.document.text, end);
         self.document.text.replace_range(start_byte..end_byte, text);
+        self.bump_doc_revision();
         let selection = (
             start + selection_offset,
             start + selection_offset + selection_len,
@@ -419,6 +495,7 @@ impl MarkGuin {
         self.document
             .text
             .replace_range(start_byte..end_byte, &replacement);
+        self.bump_doc_revision();
         self.document.dirty = true;
         self.selection = (start, start + replacement_len);
         self.requested_selection = Some(self.selection);
@@ -434,6 +511,7 @@ impl MarkGuin {
             return;
         }
         self.document.text = text;
+        self.bump_doc_revision();
         self.document.dirty = true;
         let cursor = self.cursor_char.min(self.document.text.chars().count());
         self.selection = (cursor, cursor);
@@ -474,6 +552,7 @@ impl MarkGuin {
                         match Document::open(path) {
                             Ok(document) => {
                                 self.document = document;
+                                self.bump_doc_revision();
                                 self.status = Some("Reloaded external changes".into());
                             }
                             Err(error) => self.status = Some(format!("Reload failed: {error}")),
@@ -588,7 +667,7 @@ impl MarkGuin {
             .frame(
                 egui::Frame::new()
                     .fill(BG)
-                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
                     .inner_margin(egui::Margin::symmetric(12, 9)),
             )
             .show(ctx, |ui| {
@@ -655,7 +734,7 @@ impl MarkGuin {
                             |ui| {
                                 egui::Frame::new()
                                     .fill(SURFACE_RAISED)
-                                    .stroke(egui::Stroke::new(1.0, BORDER))
+                                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
                                     .corner_radius(10)
                                     .inner_margin(2)
                                     .show(ui, |ui| {
@@ -692,7 +771,7 @@ impl MarkGuin {
                     ui.add_space(9.0);
                     egui::Frame::new()
                         .fill(SURFACE)
-                        .stroke(egui::Stroke::new(1.0, BORDER))
+                        .stroke(egui::Stroke::new(1.0_f32, BORDER))
                         .corner_radius(9)
                         .inner_margin(egui::Margin::symmetric(10, 6))
                         .show(ui, |ui| {
@@ -706,11 +785,7 @@ impl MarkGuin {
                                     response.request_focus();
                                     self.find_focus_requested = false;
                                 }
-                                let count = if self.find_query.is_empty() {
-                                    0
-                                } else {
-                                    self.document.text.matches(&self.find_query).count()
-                                };
+                                let count = self.find_match_count();
                                 ui.label(
                                     RichText::new(format!("{count} found"))
                                         .size(11.0)
@@ -747,11 +822,11 @@ impl MarkGuin {
             .frame(
                 egui::Frame::new()
                     .fill(BG)
-                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
                     .inner_margin(egui::Margin::symmetric(12, 14)),
             )
             .show(ctx, |ui| {
-                let headings = markdown::headings(&self.document.text);
+                let headings = self.cached_headings();
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Outline").strong().size(12.0).color(MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -803,7 +878,7 @@ impl MarkGuin {
     fn editor(&mut self, ui: &mut egui::Ui) {
         egui::Frame::new()
             .fill(SURFACE)
-            .stroke(egui::Stroke::new(1.0, BORDER))
+            .stroke(egui::Stroke::new(1.0_f32, BORDER))
             .inner_margin(egui::Margin::symmetric(10, 6))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -841,10 +916,7 @@ impl MarkGuin {
                     }
                 });
             });
-        let mut area = egui::ScrollArea::both().id_salt("editor_scroll");
-        if self.sync_scroll {
-            area = area.vertical_scroll_offset(self.scroll_ratio * self.editor_scroll_max);
-        }
+        let area = self.scroll_area("editor_scroll", self.editor_scroll_max);
         let scroll_output = area.show(ui, |ui| {
             let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
                 let mut job = markdown::highlight_source(text);
@@ -861,6 +933,7 @@ impl MarkGuin {
                 .margin(egui::vec2(24.0, 22.0))
                 .show(ui);
             if output.response.changed() {
+                self.bump_doc_revision();
                 self.document.dirty = true;
             }
             if let Some(range) = output.cursor_range {
@@ -882,15 +955,12 @@ impl MarkGuin {
             scroll_output.content_size.y,
             scroll_output.inner_rect.height(),
         );
-        if self.sync_scroll
-            && ui
-                .ctx()
-                .pointer_hover_pos()
-                .is_some_and(|position| scroll_output.inner_rect.contains(position))
-        {
-            self.scroll_ratio =
-                normalized_scroll(scroll_output.state.offset.y, self.editor_scroll_max);
-        }
+        self.sync_scroll_ratio(
+            ui,
+            scroll_output.inner_rect,
+            scroll_output.state.offset.y,
+            self.editor_scroll_max,
+        );
     }
 
     fn unsaved_dialog(&mut self, ctx: &egui::Context) {
@@ -1018,6 +1088,7 @@ impl MarkGuin {
                         match Document::open(path) {
                             Ok(document) => {
                                 self.document = document;
+                                self.bump_doc_revision();
                                 self.disk_conflict = None;
                                 self.status = Some("Reloaded external changes".into());
                             }
@@ -1047,7 +1118,7 @@ impl MarkGuin {
     fn preview(&mut self, ui: &mut egui::Ui) {
         egui::Frame::new()
             .fill(SURFACE)
-            .stroke(egui::Stroke::new(1.0, BORDER))
+            .stroke(egui::Stroke::new(1.0_f32, BORDER))
             .inner_margin(egui::Margin::symmetric(12, 6))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -1058,10 +1129,7 @@ impl MarkGuin {
                 });
             });
         let preview_width = ui.available_width().min(760.0);
-        let mut area = egui::ScrollArea::vertical().id_salt("preview_scroll");
-        if self.sync_scroll {
-            area = area.vertical_scroll_offset(self.scroll_ratio * self.preview_scroll_max);
-        }
+        let area = self.scroll_area("preview_scroll", self.preview_scroll_max);
         let scroll_output = area.show(ui, |ui| {
             ui.set_width(preview_width);
             ui.add_space(14.0);
@@ -1080,15 +1148,12 @@ impl MarkGuin {
             scroll_output.content_size.y,
             scroll_output.inner_rect.height(),
         );
-        if self.sync_scroll
-            && ui
-                .ctx()
-                .pointer_hover_pos()
-                .is_some_and(|position| scroll_output.inner_rect.contains(position))
-        {
-            self.scroll_ratio =
-                normalized_scroll(scroll_output.state.offset.y, self.preview_scroll_max);
-        }
+        self.sync_scroll_ratio(
+            ui,
+            scroll_output.inner_rect,
+            scroll_output.state.offset.y,
+            self.preview_scroll_max,
+        );
     }
 
     fn status_bar(&mut self, ctx: &egui::Context) {
@@ -1097,7 +1162,7 @@ impl MarkGuin {
             .frame(
                 egui::Frame::new()
                     .fill(BG)
-                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
                     .inner_margin(egui::Margin::symmetric(12, 5)),
             )
             .show(ctx, |ui| {
@@ -1294,7 +1359,7 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, tooltip: &str, selected: bool) -> 
             ui.painter().rect_stroke(
                 rect,
                 8.0,
-                egui::Stroke::new(1.0, ACCENT),
+                egui::Stroke::new(1.0_f32, ACCENT),
                 egui::StrokeKind::Inside,
             );
         }
@@ -1309,7 +1374,7 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, tooltip: &str, selected: bool) -> 
 }
 
 fn paint_icon(painter: &egui::Painter, center: egui::Pos2, icon: Icon, color: Color32) {
-    let stroke = egui::Stroke::new(1.45, color);
+    let stroke = egui::Stroke::new(1.45_f32, color);
     let x = center.x;
     let y = center.y;
     match icon {
@@ -1447,7 +1512,7 @@ fn compact_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(label).size(10.5).color(MUTED))
             .fill(SURFACE_RAISED)
-            .stroke(egui::Stroke::new(1.0, BORDER))
+            .stroke(egui::Stroke::new(1.0_f32, BORDER))
             .corner_radius(6)
             .min_size(egui::vec2(44.0, 24.0)),
     )
@@ -1469,7 +1534,7 @@ fn configure_style(ctx: &egui::Context) {
     style.visuals.override_text_color = Some(TEXT);
     style.visuals.panel_fill = BG;
     style.visuals.window_fill = SURFACE;
-    style.visuals.window_stroke = egui::Stroke::new(1.0, BORDER);
+    style.visuals.window_stroke = egui::Stroke::new(1.0_f32, BORDER);
     style.visuals.window_corner_radius = egui::CornerRadius::same(14);
     style.visuals.menu_corner_radius = egui::CornerRadius::same(10);
     style.visuals.extreme_bg_color = Color32::from_rgb(13, 16, 23);
@@ -1477,21 +1542,21 @@ fn configure_style(ctx: &egui::Context) {
     style.visuals.code_bg_color = Color32::from_rgb(28, 31, 43);
     style.visuals.hyperlink_color = Color32::from_rgb(164, 145, 255);
     style.visuals.selection.bg_fill = ACCENT_SOFT;
-    style.visuals.selection.stroke = egui::Stroke::new(1.0, Color32::from_rgb(197, 185, 255));
+    style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(197, 185, 255));
     style.visuals.widgets.noninteractive.bg_fill = SURFACE;
-    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
-    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT);
+    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
+    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
     style.visuals.widgets.inactive.weak_bg_fill = SURFACE_RAISED;
-    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER);
-    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, MUTED);
+    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
+    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, MUTED);
     style.visuals.widgets.hovered.weak_bg_fill = SURFACE_HOVER;
     style.visuals.widgets.hovered.bg_fill = SURFACE_HOVER;
-    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, BORDER);
-    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, TEXT);
+    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
+    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
     style.visuals.widgets.active.weak_bg_fill = ACCENT_SOFT;
     style.visuals.widgets.active.bg_fill = ACCENT_SOFT;
-    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, BORDER);
-    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
+    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
+    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
     for widget in [
         &mut style.visuals.widgets.noninteractive,
         &mut style.visuals.widgets.inactive,
