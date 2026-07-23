@@ -410,17 +410,9 @@ fn request_diagram_svg(
         key,
         format!("markguin-{}-render", language.css_name()),
         ctx,
-        move |ctx| {
+        move |_ctx| {
             let svg = render_diagram_svg(language, &source)?;
-            let mut hasher = DefaultHasher::new();
-            language.hash(&mut hasher);
-            source.hash(&mut hasher);
-            let texture =
-                rasterize_svg(ctx, format!("markguin-diagram-{}", hasher.finish()), &svg)?;
-            Ok(Rendered {
-                svg,
-                texture: Some(texture),
-            })
+            Ok(Rendered { svg, texture: None })
         },
     )
 }
@@ -688,16 +680,9 @@ fn request_math_svg(
         key,
         "markguin-math-render".into(),
         ctx,
-        move |ctx| {
+        move |_ctx| {
             let svg = render_math_svg_uncached(&tex, display)?;
-            let mut hasher = DefaultHasher::new();
-            tex.hash(&mut hasher);
-            display.hash(&mut hasher);
-            let texture = rasterize_svg(ctx, format!("markguin-math-{}", hasher.finish()), &svg)?;
-            Ok(Rendered {
-                svg,
-                texture: Some(texture),
-            })
+            Ok(Rendered { svg, texture: None })
         },
     )
 }
@@ -1199,10 +1184,21 @@ fn resolved_link_target(target: &str, base_dir: Option<&Path>) -> String {
     if target.starts_with('#') || is_external_target(target) {
         return target.to_owned();
     }
-    let path = resolved_local_path(target, base_dir)
-        .to_string_lossy()
-        .replace('\\', "/");
-    format!("file://{path}")
+    let path = resolved_local_path(target, base_dir);
+    as_file_uri(&path)
+}
+
+fn as_file_uri(path: &Path) -> String {
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    if path_str.len() > 2 && path_str.chars().nth(1) == Some(':') {
+        // Windows absolute path like C:/...
+        format!("file:///{path_str}")
+    } else if path_str.starts_with('/') {
+        // Unix absolute path /... -> file:// + /path = file:///path
+        format!("file://{path_str}")
+    } else {
+        format!("file://{path_str}")
+    }
 }
 
 fn render_image(ui: &mut Ui, target: &str, alt: &str, base_dir: Option<&Path>) {
@@ -1221,7 +1217,7 @@ fn render_image(ui: &mut Ui, target: &str, alt: &str, base_dir: Option<&Path>) {
         // The egui_extras file loader reads the file once on a background
         // thread and caches the bytes by URI, instead of re-reading the file
         // from disk on every frame.
-        egui::Image::new(format!("file://{}", path.display()))
+        egui::Image::new(as_file_uri(&path))
     };
     let response = ui.add(image.max_width(max_width).max_height(720.0));
     if !alt.is_empty() {
@@ -1369,8 +1365,34 @@ fn render_math(ui: &mut Ui, tex: &str, display: bool) {
 fn render_diagram(ui: &mut Ui, language: DiagramLanguage, source: &str) {
     match request_diagram_svg(ui.ctx(), language, source) {
         Some(Ok(rendered)) => {
-            if let Some(texture) = rendered.texture {
-                let max_width = ui.available_width().max(120.0);
+            let max_width = ui.available_width().max(120.0);
+            let texture = match rendered.texture {
+                Some(texture) => Some(texture),
+                None => {
+                    let mut hasher = DefaultHasher::new();
+                    language.hash(&mut hasher);
+                    source.hash(&mut hasher);
+                    rasterize_svg(
+                        ui.ctx(),
+                        format!("markguin-diagram-{}", hasher.finish()),
+                        &rendered.svg,
+                    )
+                    .ok()
+                    .inspect(|texture| {
+                        diagram_cache()
+                            .lock()
+                            .expect("diagram cache poisoned")
+                            .insert(
+                                diagram_key(language, source),
+                                RenderState::Ready(Rendered {
+                                    svg: rendered.svg,
+                                    texture: Some(texture.clone()),
+                                }),
+                            );
+                    })
+                }
+            };
+            if let Some(texture) = texture {
                 ui.horizontal_centered(|ui| {
                     ui.add(
                         egui::Image::new(&texture)
@@ -1508,6 +1530,55 @@ mod tests {
     }
 
     #[test]
+    fn source_highlighting_tracks_fence_characters() {
+        let source = "```rust\nlet x = 1;\n```\nplain\n~~~toml\nkey = 1\n~~~\n";
+        let job = highlight_source(source);
+        let colors: Vec<_> = job.sections.iter().map(|s| s.format.color).collect();
+        assert_eq!(source, job.text);
+        assert!(
+            colors.contains(&Color32::from_rgb(116, 176, 226)),
+            "opening fence"
+        );
+        assert!(
+            colors.contains(&Color32::from_rgb(174, 192, 169)),
+            "code body"
+        );
+        assert!(
+            colors.contains(&Color32::from_rgb(178, 182, 193)),
+            "plain text"
+        );
+    }
+
+    #[test]
+    fn source_highlighting_ignores_markers_inside_fences() {
+        let source = "# Heading\n```\n# not-a-heading\n> not-a-quote\n```\nplain\n<!-- TOC -->\n";
+        let job = highlight_source(source);
+        assert_eq!(source, job.text);
+        let sections = job.sections;
+        // The first line (`# Heading`) must be styled as a heading. The lines
+        // inside the fence must NOT be, even though they start with `#` or `>`.
+        assert!(
+            sections[0].format.color == Color32::from_rgb(126, 181, 230),
+            "first heading is colored"
+        );
+        let after_fence = sections
+            .iter()
+            .skip(1)
+            .all(|s| s.format.color != Color32::from_rgb(126, 181, 230));
+        assert!(after_fence, "heading color inside fence");
+        let quote_inside_fence = sections
+            .iter()
+            .any(|s| s.format.color == Color32::from_rgb(146, 177, 163) && s.format.italics);
+        assert!(!quote_inside_fence, "quote color inside fence");
+        assert!(
+            sections
+                .iter()
+                .any(|s| s.format.color == Color32::from_rgb(178, 182, 193)),
+            "plain text outside fence"
+        );
+    }
+
+    #[test]
     fn code_preview_removes_only_terminal_line_endings() {
         assert_eq!(code_block_text("let value = 1;  \n\n"), "let value = 1;  ");
         assert_eq!(code_block_text("    indented"), "    indented");
@@ -1626,6 +1697,22 @@ mod tests {
             "https://example.com"
         );
         assert_eq!(resolved_link_target("#result", Some(base)), "#result");
+    }
+
+    #[test]
+    fn file_uris_use_platform_appropriate_absolute_forms() {
+        assert_eq!(
+            as_file_uri(Path::new(r"C:\notes\cover image.png")),
+            "file:///C:/notes/cover image.png"
+        );
+        assert_eq!(
+            as_file_uri(Path::new("/notes/cover image.png")),
+            "file:///notes/cover image.png"
+        );
+        assert_eq!(
+            as_file_uri(Path::new("assets/icon.svg")),
+            "file://assets/icon.svg"
+        );
     }
 
     #[test]

@@ -4,8 +4,11 @@ use std::{
     hash::{Hash, Hasher},
     io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::SystemTime,
 };
+
+static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const WELCOME_DOCUMENT: &str = r#"# Welcome to MarkGuin
 
@@ -129,8 +132,9 @@ impl Document {
         // existing file on disk.
         let mut tmp = path.to_path_buf();
         tmp.set_extension(format!(
-            "tmp-{}-{}",
+            "tmp-{}-{}-{}",
             std::process::id(),
+            SAVE_COUNTER.fetch_add(1, Ordering::Relaxed),
             content_hash(&self.text)
         ));
         fs::write(&tmp, &self.text)?;
