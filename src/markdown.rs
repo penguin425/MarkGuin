@@ -1189,7 +1189,14 @@ fn resolved_link_target(target: &str, base_dir: Option<&Path>) -> String {
 }
 
 fn as_file_uri(path: &Path) -> String {
-    let path_str = path.to_string_lossy().replace('\\', "/");
+    let raw_path = path.to_string_lossy();
+    if let Some(unc_path) = raw_path
+        .strip_prefix(r"\\")
+        .or_else(|| raw_path.strip_prefix("//"))
+    {
+        return format!("file://{}", unc_path.replace('\\', "/"));
+    }
+    let path_str = raw_path.replace('\\', "/");
     if path_str.len() > 2 && path_str.chars().nth(1) == Some(':') {
         // Windows absolute path like C:/...
         format!("file:///{path_str}")
@@ -1198,6 +1205,24 @@ fn as_file_uri(path: &Path) -> String {
         format!("file://{path_str}")
     } else {
         format!("file://{path_str}")
+    }
+}
+
+/// Produces a URI that preserves a Windows UNC filesystem root after
+/// egui_extras removes the `file://` prefix.
+///
+/// Its Windows file loader strips every leading forward slash, so the standard
+/// `file://server/share/file.png` form would become a relative path. Keeping
+/// the UNC portion in native backslash form leaves `\\server\share` intact for
+/// `std::fs::read`, while normal paths continue to use standard file URIs.
+fn as_egui_file_uri(path: &Path) -> String {
+    let raw_path = path.to_string_lossy();
+    if raw_path.starts_with(r"\\") {
+        format!("file://{raw_path}")
+    } else if raw_path.starts_with("//") {
+        format!("file://{}", raw_path.replace('/', r"\"))
+    } else {
+        as_file_uri(path)
     }
 }
 
@@ -1217,7 +1242,7 @@ fn render_image(ui: &mut Ui, target: &str, alt: &str, base_dir: Option<&Path>) {
         // The egui_extras file loader reads the file once on a background
         // thread and caches the bytes by URI, instead of re-reading the file
         // from disk on every frame.
-        egui::Image::new(as_file_uri(&path))
+        egui::Image::new(as_egui_file_uri(&path))
     };
     let response = ui.add(image.max_width(max_width).max_height(720.0));
     if !alt.is_empty() {
@@ -1712,6 +1737,18 @@ mod tests {
         assert_eq!(
             as_file_uri(Path::new("assets/icon.svg")),
             "file://assets/icon.svg"
+        );
+        assert_eq!(
+            as_file_uri(Path::new(r"\\server\share\cover image.png")),
+            "file://server/share/cover image.png"
+        );
+        assert_eq!(
+            as_egui_file_uri(Path::new(r"\\server\share\cover image.png")),
+            r"file://\\server\share\cover image.png"
+        );
+        assert_eq!(
+            as_egui_file_uri(Path::new("//server/share/cover image.png")),
+            r"file://\\server\share\cover image.png"
         );
     }
 
